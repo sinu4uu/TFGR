@@ -218,19 +218,15 @@ def parse_fampay_email(html_body: str, plain_body: str, date_obj: datetime = Non
         time_str = ""
 
     return {
-        "money":            raw_amount,
-        "amount_num":       amount_num,
-        "name":             name,
-        "txn_id":           txn_id,
-        "utr":              utr,
-        "purpose":          purpose,
-        "order_id":         purpose,  # Purpose is the Order ID
-        "txn_type":         txn_type,
-        "payment":          status,
-        "date":             date_str,
-        "time":             time_str,
-        "table_date":       table_date,
-        "updated_balance":  details.get("updated balance", "")
+        "money":        raw_amount,
+        "amount_num":   amount_num,
+        "name":         name,
+        "txn_id":       txn_id,
+        "utr":          utr,
+        "purpose":      purpose,
+        "payment":      status,
+        "date":         date_str,
+        "time":         time_str,
     }
 
 
@@ -238,8 +234,7 @@ def search_gmail(
     query_id: str,
     expected_amount: float = None,
     expected_purpose: str = None,
-    max_age_seconds: float = None,
-    expected_txn_type: str = None
+    max_age_seconds: float = None
 ) -> dict:
     """Connect via IMAP and search for FamPay payment email matching query/purpose."""
     start_time = time.time()
@@ -358,11 +353,6 @@ def search_gmail(
             is_verified = False
             verification_reasons.append(f"Payment status is {result['payment']}")
 
-        # Direction check (if user requested Credit only)
-        if expected_txn_type and result["txn_type"].lower() != expected_txn_type.lower():
-            is_verified = False
-            verification_reasons.append(f"Transaction type is {result['txn_type']}, expected {expected_txn_type}")
-
         # Amount validation check
         if expected_amount is not None:
             if abs(result["amount_num"] - expected_amount) > 0.01:
@@ -473,9 +463,6 @@ def api_fampay():
         except ValueError:
             pass
 
-    # Optional txn type filter (?txn_type=Credit)
-    expected_txn_type = request.args.get("txn_type") or request.args.get("type")
-
     # If both id and purpose were passed, search by id and verify purpose
     expected_purpose = purpose_param if purpose_param else None
     if id_param and purpose_param:
@@ -486,8 +473,7 @@ def api_fampay():
         query_id=query_id,
         expected_amount=expected_amount,
         expected_purpose=expected_purpose,
-        max_age_seconds=max_age_seconds,
-        expected_txn_type=expected_txn_type
+        max_age_seconds=max_age_seconds
     )
 
     status_code = 200 if result.get("found") else 404 if "error" not in result else 500
