@@ -1,6 +1,15 @@
+import codecs
 import encodings.idna
 import encodings.ascii
 import encodings.utf_8
+
+def _idna_codec_search(encoding_name):
+    if encoding_name.lower().replace("-", "_") == "idna":
+        return encodings.idna.getregentry()
+    return None
+
+codecs.register(_idna_codec_search)
+
 import imaplib
 import email
 from email.utils import parsedate_to_datetime, parseaddr
@@ -604,27 +613,38 @@ def api_fampay():
     if not result.get("found"):
         status_code = 500 if "error" in result else 404
         return jsonify({
-            "status": "failed",
+            "amount": 0,
             "date": now_ist.strftime("%d %b %Y"),
-            "time": now_ist.strftime("%I:%M %p"),
-            "order_id": order_id or query_id,
             "error": result.get("error", "Transaction not found."),
-            "time_taken": result.get("time_taken")
+            "name": "",
+            "order_id": order_id or query_id,
+            "status": "failed",
+            "time": now_ist.strftime("%I:%M %p"),
+            "time_taken": result.get("time_taken", "0.0s"),
+            "txn_id": "",
+            "utr": ""
         }), status_code
 
     tx = result["results"][0] if result.get("results") else {}
     status_str = result.get("status", "failed")
 
+    amt_val = tx.get("amount_num", 0.0)
+    try:
+        amt_num = float(amt_val)
+        amt_formatted = int(amt_num) if amt_num.is_integer() else amt_num
+    except Exception:
+        amt_formatted = amt_val
+
     response_payload = {
-        "status": status_str,
+        "amount": amt_formatted,
         "date": tx.get("date", ""),
-        "time": tx.get("time", ""),
-        "order_id": tx.get("purpose") or order_id or query_id,
-        "amount": tx.get("amount_num", 0.0),
         "name": tx.get("name", ""),
-        "utr": tx.get("utr", ""),
+        "order_id": tx.get("purpose") or order_id or query_id,
+        "status": status_str,
+        "time": tx.get("time", ""),
+        "time_taken": result.get("time_taken", ""),
         "txn_id": tx.get("txn_id", ""),
-        "time_taken": result.get("time_taken", "")
+        "utr": tx.get("utr", "")
     }
 
     return jsonify(response_payload), 200
