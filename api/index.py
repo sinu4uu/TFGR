@@ -54,6 +54,8 @@ def clean_body(text: str) -> str:
     """Strip HTML tags, decode entities, collapse whitespace."""
     if not text:
         return ""
+    text = re.sub(r'<style[^>]*>.*?</style>', ' ', text, flags=re.I | re.DOTALL)
+    text = re.sub(r'<script[^>]*>.*?</script>', ' ', text, flags=re.I | re.DOTALL)
     text = text.replace("&nbsp;", " ").replace("&amp;", "&")
     text = text.replace("&lt;", "<").replace("&gt;", ">")
     text = text.replace("&quot;", '"').replace("&#39;", "'")
@@ -147,11 +149,13 @@ def parse_fampay_email(html_body: str, plain_body: str, date_obj: datetime = Non
     purpose = details.get("purpose", "")
     if not purpose:
         purpose_match = (
-            re.search(r"Purpose\s*[:#-]?\s*([A-Za-z0-9_\-]+)", combined_text, re.I) or
-            re.search(r"Order\s*(?:ID|No)?\s*[:#-]?\s*([A-Za-z0-9_\-]+)", combined_text, re.I)
+            re.search(r"\bPurpose\b\s*[:#-]?\s*([A-Za-z0-9_\-]+)", combined_text, re.I) or
+            re.search(r"\bOrder\s*(?:ID|No)?\b\s*[:#-]?\s*([A-Za-z0-9_\-]+)", combined_text, re.I)
         )
         if purpose_match:
-            purpose = purpose_match.group(1).strip()
+            candidate = purpose_match.group(1).strip()
+            if candidate.lower() not in ("1px", "0px", "solid", "none", "border"):
+                purpose = candidate
 
     # 3. Transaction ID Extraction
     txn_id = details.get("transaction id", "")
@@ -639,7 +643,7 @@ def api_fampay():
         "amount": amt_formatted,
         "date": tx.get("date", ""),
         "name": tx.get("name", ""),
-        "order_id": tx.get("purpose") or order_id or query_id,
+        "order_id": tx.get("purpose") or order_id or "",
         "status": status_str,
         "time": tx.get("time", ""),
         "time_taken": result.get("time_taken", ""),
