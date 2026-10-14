@@ -1,3 +1,6 @@
+import encodings.idna
+import encodings.ascii
+import encodings.utf_8
 import imaplib
 import email
 from email.utils import parsedate_to_datetime, parseaddr

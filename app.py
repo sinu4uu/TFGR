@@ -1,3 +1,6 @@
+import encodings.idna
+import encodings.ascii
+import encodings.utf_8
 import os
 from api.index import app
 
