@@ -7,6 +7,8 @@ import time
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
 import base64
+import threading
+import select
 
 try:
     from dotenv import load_dotenv
@@ -224,174 +226,291 @@ def parse_fampay_email(html_body: str, plain_body: str, date_obj: datetime = Non
         "txn_id":       txn_id,
         "utr":          utr,
         "purpose":      purpose,
+        "txn_type":     txn_type,
         "payment":      status,
         "date":         date_str,
         "time":         time_str,
     }
 
 
+# ─────────────────────────────────────────────
+#  HIGH-SPEED IN-MEMORY CACHE & CONNECTION POOL
+# ─────────────────────────────────────────────
+ORDER_CACHE    = {}       # { key.lower(): txn_data }
+ORDER_LOCK     = threading.Lock()
+
+_REUSABLE_MAIL = None
+_MAIL_LOCK     = threading.Lock()
+
+def cache_transaction(tx: dict):
+    """Store transaction into memory cache under Order ID (purpose), UTR, and TxnID."""
+    if not tx:
+        return
+    keys = [
+        tx.get("purpose", "").strip().lower(),
+        tx.get("utr", "").strip().lower(),
+        tx.get("txn_id", "").strip().lower(),
+    ]
+    with ORDER_LOCK:
+        for k in keys:
+            if k:
+                ORDER_CACHE[k] = tx
+        if len(ORDER_CACHE) > 500:
+            for oldest in list(ORDER_CACHE.keys())[:100]:
+                del ORDER_CACHE[oldest]
+
+
+def get_authenticated_mail():
+    """Acquire or reuse live IMAP session to eliminate the 3-4s SSL handshake & Login penalty."""
+    global _REUSABLE_MAIL
+    if _REUSABLE_MAIL is not None:
+        try:
+            status, _ = _REUSABLE_MAIL.noop()
+            if status == "OK":
+                return _REUSABLE_MAIL
+        except Exception:
+            try:
+                _REUSABLE_MAIL.logout()
+            except Exception:
+                pass
+            _REUSABLE_MAIL = None
+
+    m = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
+    m.login(EMAIL_ADDRESS, EMAIL_APP_PASS)
+    m.select("INBOX")
+    _REUSABLE_MAIL = m
+    return _REUSABLE_MAIL
+
+
+def background_idle_listener():
+    """0-second real-time Gmail Push listener. Pre-caches any incoming payments automatically."""
+    while True:
+        m = None
+        try:
+            m = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
+            m.login(EMAIL_ADDRESS, EMAIL_APP_PASS)
+            m.select("INBOX")
+
+            # Initial catchup: fetch last 3 FamPay emails and pre-cache
+            status, data = m.search(None, 'X-GM-RAW', f'from:{ALLOWED_SENDER}')
+            if status == "OK" and data and data[0]:
+                for eid in data[0].split()[-3:]:
+                    try:
+                        s, msg_data = m.fetch(eid, "(RFC822)")
+                        if s == "OK" and msg_data and msg_data[0]:
+                            msg = email.message_from_bytes(msg_data[0][1])
+                            d, _ = get_email_datetime_and_age(msg)
+                            hb, pb = extract_email_bodies(msg)
+                            parsed = parse_fampay_email(hb, pb, d, msg.get("Subject", ""))
+                            cache_transaction(parsed)
+                    except Exception:
+                        pass
+
+            while True:
+                tag = m._command("IDLE")
+                start_idle = time.time()
+                while time.time() - start_idle < 1500:
+                    if hasattr(m.sock, "pending") and m.sock.pending() > 0:
+                        break
+                    r, _, _ = select.select([m.sock], [], [], 2.0)
+                    if r:
+                        break
+
+                m.send(b"DONE\r\n")
+                try:
+                    m._command_complete("IDLE", tag)
+                except Exception:
+                    pass
+
+                # Email arrived! Fetch and cache immediately
+                status, data = m.search(None, 'X-GM-RAW', f'from:{ALLOWED_SENDER}')
+                if status == "OK" and data and data[0]:
+                    latest_id = data[0].split()[-1]
+                    s, msg_data = m.fetch(latest_id, "(RFC822)")
+                    if s == "OK" and msg_data and msg_data[0]:
+                        msg = email.message_from_bytes(msg_data[0][1])
+                        d, _ = get_email_datetime_and_age(msg)
+                        hb, pb = extract_email_bodies(msg)
+                        parsed = parse_fampay_email(hb, pb, d, msg.get("Subject", ""))
+                        cache_transaction(parsed)
+        except Exception:
+            time.sleep(4)
+        finally:
+            if m:
+                try:
+                    m.logout()
+                except Exception:
+                    pass
+
+
+_WORKER_STARTED = False
+_WORKER_LOCK = threading.Lock()
+
+def start_background_watcher():
+    global _WORKER_STARTED
+    with _WORKER_LOCK:
+        if not _WORKER_STARTED:
+            _WORKER_STARTED = True
+            t = threading.Thread(target=background_idle_listener, daemon=True)
+            t.start()
+
+start_background_watcher()
+
+
 def search_gmail(
     query_id: str,
     expected_amount: float = None,
-    expected_purpose: str = None,
-    max_age_seconds: float = None
+    expected_purpose: str = None
 ) -> dict:
-    """Connect via IMAP and search for FamPay payment email matching query/purpose."""
+    """Fast verify: Memory cache (~0.001s) -> Reusable IMAP connection (~0.3s)."""
     start_time = time.time()
-
-    if max_age_seconds is None:
-        max_age_seconds = DEFAULT_MAX_AGE
-
-    if not EMAIL_ADDRESS or not EMAIL_APP_PASS:
-        return {
-            "error": "Server improperly configured: EMAIL_ADDRESS / EMAIL_APP_PASS env vars missing.",
-            "found": False,
-            "verified": False,
-            "time_taken": f"{round(time.time() - start_time, 2)}s"
-        }
 
     clean_query = re.sub(r'["\\]', '', query_id).strip()
     if not clean_query:
         return {
             "error": "Invalid search query",
             "found": False,
-            "verified": False,
-            "time_taken": f"{round(time.time() - start_time, 2)}s"
+            "status": "failed",
+            "time_taken": f"{round(time.time() - start_time, 3)}s"
         }
 
-    try:
-        mail = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
-        mail.login(EMAIL_ADDRESS, EMAIL_APP_PASS)
-    except imaplib.IMAP4.error as e:
-        return {
-            "error": f"Login failed: {str(e)}. Check your email and App Password.",
-            "found": False,
-            "verified": False,
-            "time_taken": f"{round(time.time() - start_time, 2)}s"
-        }
-    except Exception as e:
-        return {
-            "error": f"Connection error: {str(e)}",
-            "found": False,
-            "verified": False,
-            "time_taken": f"{round(time.time() - start_time, 2)}s"
-        }
+    # 1. ⚡ INSTANT MEMORY CACHE LOOKUP (~0.001s)
+    lookup_key = (expected_purpose or clean_query).strip().lower()
+    with ORDER_LOCK:
+        cached_tx = ORDER_CACHE.get(lookup_key) or ORDER_CACHE.get(clean_query.lower())
 
-    try:
-        mail.select("INBOX")
+    if cached_tx:
+        is_success = True
+        if cached_tx.get("txn_type") == "Debit" or cached_tx.get("payment") != "Success":
+            is_success = False
 
-        # Standard IMAP search for email from ALLOWED_SENDER containing the query text
-        status, data = mail.search(None, f'(FROM "{ALLOWED_SENDER}" TEXT "{clean_query}")')
+        if expected_purpose:
+            if (cached_tx.get("purpose") or "").strip().lower() != expected_purpose.strip().lower():
+                is_success = False
 
-        if status != "OK" or not data or not data[0]:
-            mail.logout()
-            return {
-                "query": clean_query,
-                "found": False,
-                "verified": False,
-                "verification_message": f"No payment alert found from {ALLOWED_SENDER} matching query '{clean_query}'.",
-                "time_taken": f"{round(time.time() - start_time, 2)}s",
-                "results": []
-            }
-
-        # Get the latest matching email
-        email_ids = data[0].split()
-        latest_id = email_ids[-1]
-
-        status, msg_data = mail.fetch(latest_id, "(RFC822)")
-        if status != "OK":
-            mail.logout()
-            return {
-                "query": clean_query,
-                "found": False,
-                "verified": False,
-                "verification_message": "Failed to fetch email details.",
-                "time_taken": f"{round(time.time() - start_time, 2)}s",
-                "results": []
-            }
-
-        raw_email = msg_data[0][1]
-        msg = email.message_from_bytes(raw_email)
-
-        # 1. Strict Sender Verification check
-        from_header = msg.get("From", "")
-        if not is_valid_sender(msg):
-            mail.logout()
-            return {
-                "query": clean_query,
-                "found": False,
-                "verified": False,
-                "verification_message": f"Security alert: Sender '{from_header}' is not {ALLOWED_SENDER}.",
-                "time_taken": f"{round(time.time() - start_time, 2)}s",
-                "results": []
-            }
-
-        # 2. Date & Age check
-        date_obj, age_seconds = get_email_datetime_and_age(msg)
-        is_expired = age_seconds > max_age_seconds
-
-        # 3. Extract bodies and parse using HTML parser
-        subject = msg.get("Subject", "")
-        html_body, plain_body = extract_email_bodies(msg)
-        result = parse_fampay_email(html_body, plain_body, date_obj, subject)
-
-        mail.logout()
-
-        # 4. Strict Verification Rules
-        is_verified = True
-        verification_reasons = []
-
-        # Age check
-        if is_expired:
-            is_verified = False
-            last_dt = f"{result['date']} at {result['time']}".strip()
-            max_hrs = round(max_age_seconds / 3600, 1)
-            verification_reasons.append(f"Payment exceeded max age of {max_hrs}h (Payment date: {last_dt})")
-
-        # Payment status check
-        if result["payment"] != "Success":
-            is_verified = False
-            verification_reasons.append(f"Payment status is {result['payment']}")
-
-        # Amount validation check
         if expected_amount is not None:
-            if abs(result["amount_num"] - expected_amount) > 0.01:
-                is_verified = False
-                verification_reasons.append(f"Amount mismatch: Expected ₹{expected_amount}, but found ₹{result['amount_num']}")
-
-        # Purpose / Order ID verification check
-        target_purpose = (expected_purpose or "").strip()
-        if target_purpose:
-            extracted_purpose = (result.get("purpose") or "").strip()
-            if not extracted_purpose or target_purpose.lower() not in extracted_purpose.lower():
-                is_verified = False
-                verification_reasons.append(f"Purpose mismatch: Expected '{target_purpose}', but email has '{extracted_purpose}'")
-
-        if is_verified:
-            ver_message = "Payment verified successfully."
-        else:
-            ver_message = " | ".join(verification_reasons)
+            if abs(cached_tx.get("amount_num", 0.0) - expected_amount) > 0.01:
+                is_success = False
 
         return {
             "query": clean_query,
             "found": True,
-            "verified": is_verified,
-            "verification_message": ver_message,
-            "time_taken": f"{round(time.time() - start_time, 2)}s",
-            "results": [result]
+            "status": "success" if is_success else "failed",
+            "time_taken": f"{round(time.time() - start_time, 3)}s",
+            "results": [cached_tx]
         }
 
-    except Exception as e:
-        try:
-            mail.logout()
-        except Exception:
-            pass
+    # 2. ⚡ REUSABLE IMAP CONNECTION LOOKUP (~0.3s)
+    if not EMAIL_ADDRESS or not EMAIL_APP_PASS:
         return {
-            "error": str(e),
+            "error": "Server improperly configured: EMAIL_ADDRESS / EMAIL_APP_PASS env vars missing.",
             "found": False,
-            "verified": False,
-            "time_taken": f"{round(time.time() - start_time, 2)}s"
+            "status": "failed",
+            "time_taken": f"{round(time.time() - start_time, 3)}s"
         }
+
+    with _MAIL_LOCK:
+        try:
+            mail = get_authenticated_mail()
+        except Exception as e:
+            return {
+                "error": f"Connection error: {str(e)}",
+                "found": False,
+                "status": "failed",
+                "time_taken": f"{round(time.time() - start_time, 3)}s"
+            }
+
+        try:
+            # Fast Search: Use Gmail's native X-GM-RAW index search first
+            status = "NO"
+            data = [b""]
+            try:
+                raw_search = f'from:{ALLOWED_SENDER} "{clean_query}"'
+                status, data = mail.search(None, 'X-GM-RAW', f'"{raw_search}"')
+            except Exception:
+                status = "NO"
+
+            # Fallback to standard IMAP search if X-GM-RAW is unavailable
+            if status != "OK" or not data or not data[0]:
+                status, data = mail.search(None, f'(FROM "{ALLOWED_SENDER}" TEXT "{clean_query}")')
+
+            if status != "OK" or not data or not data[0]:
+                return {
+                    "query": clean_query,
+                    "found": False,
+                    "status": "failed",
+                    "time_taken": f"{round(time.time() - start_time, 3)}s",
+                    "results": []
+                }
+
+            # Get the latest matching email
+            email_ids = data[0].split()
+            latest_id = email_ids[-1]
+
+            status, msg_data = mail.fetch(latest_id, "(RFC822)")
+            if status != "OK":
+                return {
+                    "query": clean_query,
+                    "found": False,
+                    "status": "failed",
+                    "error": "Failed to fetch email details.",
+                    "time_taken": f"{round(time.time() - start_time, 3)}s",
+                    "results": []
+                }
+
+            raw_email = msg_data[0][1]
+            msg = email.message_from_bytes(raw_email)
+
+            if not is_valid_sender(msg):
+                return {
+                    "query": clean_query,
+                    "found": False,
+                    "status": "failed",
+                    "error": f"Security alert: Sender is not {ALLOWED_SENDER}.",
+                    "time_taken": f"{round(time.time() - start_time, 3)}s",
+                    "results": []
+                }
+
+            date_obj, _ = get_email_datetime_and_age(msg)
+            subject = msg.get("Subject", "")
+            html_body, plain_body = extract_email_bodies(msg)
+            result = parse_fampay_email(html_body, plain_body, date_obj, subject)
+
+            # Pre-cache this transaction so subsequent calls take ~0.001s!
+            cache_transaction(result)
+
+            is_success = True
+            if result.get("txn_type") == "Debit" or result.get("payment") != "Success":
+                is_success = False
+
+            target_purpose = (expected_purpose or "").strip()
+            if target_purpose:
+                extracted_purpose = (result.get("purpose") or "").strip()
+                if not extracted_purpose or target_purpose.lower() != extracted_purpose.lower():
+                    is_success = False
+
+            if expected_amount is not None:
+                actual_amt = result.get("amount_num", 0.0)
+                if abs(actual_amt - expected_amount) > 0.01:
+                    is_success = False
+
+            return {
+                "query": clean_query,
+                "found": True,
+                "status": "success" if is_success else "failed",
+                "time_taken": f"{round(time.time() - start_time, 3)}s",
+                "results": [result]
+            }
+
+        except Exception as e:
+            global _REUSABLE_MAIL
+            _REUSABLE_MAIL = None
+            return {
+                "error": str(e),
+                "found": False,
+                "status": "failed",
+                "time_taken": f"{round(time.time() - start_time, 3)}s"
+            }
 
 
 # ─────────────────────────────────────────────
@@ -407,77 +526,105 @@ def add_cors_headers(response):
     return response
 
 
-@app.route("/", methods=["GET", "OPTIONS"])
-@app.route("/api/fampay", methods=["GET", "OPTIONS"])
-@app.route("/api/verify", methods=["GET", "OPTIONS"])
+@app.route("/", methods=["GET", "POST", "OPTIONS"])
+@app.route("/api/fampay", methods=["GET", "POST", "OPTIONS"])
+@app.route("/api/verify", methods=["GET", "POST", "OPTIONS"])
+@app.route("/api/verify-order", methods=["GET", "POST", "OPTIONS"])
 def api_fampay():
     if request.method == "OPTIONS":
         return "", 204
 
-    # Purpose / Order ID parameter (Priority for order id verification)
-    purpose_param = (
-        request.args.get("purpose") or
+    # Extract parameters from query string (GET) or JSON body (POST)
+    json_data = request.get_json(silent=True) or {} if request.method == "POST" else {}
+
+    # Purpose / Order ID parameter
+    order_id = (
+        json_data.get("order_id") or
+        json_data.get("purpose") or
+        json_data.get("order") or
         request.args.get("order_id") or
+        request.args.get("purpose") or
         request.args.get("order") or
         ""
     ).strip()
 
     # UTR or Txn ID parameter
-    id_param = (
+    txn_ref = (
+        json_data.get("id") or
+        json_data.get("utr") or
+        json_data.get("transaction") or
         request.args.get("id") or
         request.args.get("utr") or
         request.args.get("transaction") or
         ""
     ).strip()
 
-    # Primary search query is purpose if provided, otherwise UTR/TxnID
-    query_id = purpose_param or id_param
+    query_id = order_id or txn_ref
     if not query_id:
         return jsonify({
-            "error": "Provide query via ?purpose= (Order ID), ?order_id=, ?id=, or ?utr=",
-            "verified": False
+            "status": "failed",
+            "found": False,
+            "error": "Provide Order ID or UTR via 'order_id' / 'purpose' or 'utr' / 'id'"
         }), 400
 
-    # Optional expected amount validation (?amount=500 or ?money=500)
-    expected_amount_str = request.args.get("amount") or request.args.get("money")
+    # Expected amount validation
+    expected_amount_raw = (
+        json_data.get("amount") or
+        json_data.get("money") or
+        request.args.get("amount") or
+        request.args.get("money")
+    )
     expected_amount = None
-    if expected_amount_str:
+    if expected_amount_raw is not None and str(expected_amount_raw).strip() != "":
         try:
-            expected_amount = float(expected_amount_str.replace(",", "").strip())
+            expected_amount = float(str(expected_amount_raw).replace(",", "").strip())
         except ValueError:
             return jsonify({
-                "error": "Invalid 'amount' parameter format. Must be numeric.",
-                "verified": False
+                "status": "failed",
+                "found": False,
+                "error": "Invalid 'amount' parameter format. Must be numeric."
             }), 400
 
-    # Optional max age customization (?max_age_hours=24 or ?max_age=86400)
-    max_age_seconds = None
-    if request.args.get("max_age_hours"):
-        try:
-            max_age_seconds = float(request.args.get("max_age_hours")) * 3600
-        except ValueError:
-            pass
-    elif request.args.get("max_age"):
-        try:
-            max_age_seconds = float(request.args.get("max_age"))
-        except ValueError:
-            pass
-
-    # If both id and purpose were passed, search by id and verify purpose
-    expected_purpose = purpose_param if purpose_param else None
-    if id_param and purpose_param:
-        query_id = id_param
-        expected_purpose = purpose_param
+    # Search Gmail by query
+    expected_purpose = order_id if order_id else None
+    if txn_ref and order_id:
+        query_id = txn_ref
+        expected_purpose = order_id
 
     result = search_gmail(
         query_id=query_id,
         expected_amount=expected_amount,
-        expected_purpose=expected_purpose,
-        max_age_seconds=max_age_seconds
+        expected_purpose=expected_purpose
     )
 
-    status_code = 200 if result.get("found") else 404 if "error" not in result else 500
-    return jsonify(result), status_code
+    now_ist = datetime.now(IST)
+    if not result.get("found"):
+        status_code = 500 if "error" in result else 404
+        return jsonify({
+            "status": "failed",
+            "date": now_ist.strftime("%d %b %Y"),
+            "time": now_ist.strftime("%I:%M %p"),
+            "order_id": order_id or query_id,
+            "error": result.get("error", "Transaction not found."),
+            "time_taken": result.get("time_taken")
+        }), status_code
+
+    tx = result["results"][0] if result.get("results") else {}
+    status_str = result.get("status", "failed")
+
+    response_payload = {
+        "status": status_str,
+        "date": tx.get("date", ""),
+        "time": tx.get("time", ""),
+        "order_id": tx.get("purpose") or order_id or query_id,
+        "amount": tx.get("amount_num", 0.0),
+        "name": tx.get("name", ""),
+        "utr": tx.get("utr", ""),
+        "txn_id": tx.get("txn_id", ""),
+        "time_taken": result.get("time_taken", "")
+    }
+
+    return jsonify(response_payload), 200
 
 
 @app.route("/api/health", methods=["GET", "OPTIONS"])
@@ -487,15 +634,13 @@ def health():
 
     return jsonify({
         "status": "ok",
-        "service": "FamPay Payment Verification API",
+        "service": "FamPay Website Order Verification API",
         "sender_filter": ALLOWED_SENDER,
-        "default_max_age_hours": round(DEFAULT_MAX_AGE / 3600, 1),
-        "supported_params": [
-            "purpose / order_id",
-            "utr / id / transaction",
-            "amount / money",
-            "max_age_hours / max_age",
-            "txn_type / type"
+        "freshness_check": "Disabled (Order ID based permanent verification)",
+        "supported_endpoints": [
+            "GET/POST /api/verify-order?order_id=SX...&amount=50",
+            "GET/POST /api/verify?order_id=SX...&amount=50",
+            "GET/POST /api/fampay?id=UTR..."
         ]
     })
 
